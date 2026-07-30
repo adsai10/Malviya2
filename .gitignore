@@ -1,0 +1,4 @@
+__pycache__/
+# keep images/ tracked - they are site content
+*.pyc
+.DS_Store
