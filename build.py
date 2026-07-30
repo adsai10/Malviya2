@@ -27,7 +27,7 @@ CITY = "New Delhi"
 
 # Set this to your real Vercel URL after first deploy. It drives canonical
 # tags and sitemap.xml, so get it right before submitting to Search Console.
-SITE_URL = "https://malviyaconnect.vercel.app"
+SITE_URL = "https://malviya2.vercel.app"
 
 # CATEGORIES - the keyword research output goes HERE.
 # `slug` becomes the URL, so changing it changes the URL. Decide slugs before
