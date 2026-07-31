@@ -11,9 +11,12 @@ Then: commit dist/ and push. Vercel serves it.
 import csv
 import html
 import json
+import mimetypes
+import os
 import re
 import shutil
 import unicodedata
+import urllib.request
 from pathlib import Path
 
 # ----------------------------------------------------------------------------
@@ -78,6 +81,13 @@ CATEGORIES = [
 ABOUT_VIDEO = ""
 ABOUT_VIDEO_CAPTION = "A morning walk through the main market, filmed in July 2026."
 
+# HOMEPAGE HERO
+# Same idea as ABOUT_VIDEO above - paste a YouTube video ID to show a short
+# clip in the hero, next to the headline. Leave it empty and the hero just
+# stays text-only (today's layout).
+HERO_VIDEO = "0mNoliWVk4M"
+HERO_VIDEO_CAPTION = f"A quick look at {AREA}."
+
 # Market photos go in images/gallery/ - any .jpg/.png/.webp is picked up.
 # The filename becomes the caption, so name them properly:
 #   main-market-at-dusk.jpg  ->  "Main market at dusk"
@@ -90,7 +100,19 @@ IMAGES = Path("images")
 
 # Drop shop photos into images/ named after the slug, e.g. images/rose-cafe.jpg
 # The build finds them automatically. Missing photos get a designed placeholder.
+#
+# For any shop with no local file, the build tries two fallbacks, in order:
+#   1. Google Places Photos, using the `placeId` column your CSV already has -
+#      this is the actual photo Google shows for that exact listing on Maps.
+#      Requires a Google Maps Platform API key with the Places API (New)
+#      enabled, set as an environment variable before you run the build:
+#         export GOOGLE_PLACES_API_KEY="your-key-here"
+#      Leave it unset and this step is simply skipped.
+#   2. A URL in an `image_url` column in shops.csv, if you've filled one in.
+# Either way, once a photo is downloaded it's a normal local file - re-running
+# the build won't re-fetch or re-download it unless you delete it.
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 
 # ----------------------------------------------------------------------------
 # HELPERS
@@ -125,6 +147,104 @@ def find_image(slug: str):
         if (IMAGES / f"{slug}{ext}").exists():
             return f"{slug}{ext}"
     return None
+
+
+def download_image(url: str, slug: str):
+    """Download url into images/<slug>.<ext>. Returns the filename, or None
+    on failure (a missing/broken URL just falls back to the placeholder tile,
+    it never stops the build)."""
+    url = (url or "").strip()
+    if not url:
+        return None
+
+    existing = find_image(slug)
+    if existing:  # already downloaded (or hand-placed) - don't re-fetch
+        return existing
+
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; MalviyaConnectBot/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "")
+    except Exception as e:
+        print(f"  ! Could not download image for '{slug}': {e}")
+        return None
+
+    # Prefer the extension in the URL itself; fall back to sniffing Content-Type.
+    ext = Path(url.split("?")[0]).suffix.lower()
+    if ext not in IMAGE_EXT:
+        ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".jpg"
+        ext = ".jpg" if ext == ".jpe" else ext
+        if ext not in IMAGE_EXT:
+            ext = ".jpg"
+
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    dest = IMAGES / f"{slug}{ext}"
+    dest.write_bytes(data)
+    print(f"  + downloaded {dest.name}")
+    return dest.name
+
+
+def fetch_place_photo(place_id: str, slug: str):
+    """Fetch the photo Google has on file for this exact business (via its
+    Places `placeId`) and save it into images/<slug>.<ext>. Returns the
+    filename, or None if there's no API key, no placeId, no photo on file,
+    or the request fails - any of which just falls back to image_url or the
+    placeholder tile, never stops the build."""
+    place_id = (place_id or "").strip()
+    if not place_id or not GOOGLE_PLACES_API_KEY:
+        return None
+
+    existing = find_image(slug)
+    if existing:
+        return existing
+
+    # Step 1: ask Place Details (New) for this place's photo list. Field mask
+    # is restricted to "photos" alone to stay on the cheapest applicable SKU.
+    details_req = urllib.request.Request(
+        f"https://places.googleapis.com/v1/places/{place_id}",
+        headers={
+            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask": "photos",
+        },
+    )
+    try:
+        with urllib.request.urlopen(details_req, timeout=15) as resp:
+            details = json.loads(resp.read())
+    except Exception as e:
+        print(f"  ! Places lookup failed for '{slug}': {e}")
+        return None
+
+    photos = details.get("photos") or []
+    if not photos:
+        return None
+
+    # Step 2: resolve that photo resource to actual image bytes.
+    photo_name = photos[0]["name"]  # "places/{place_id}/photos/{photo_ref}"
+    media_url = (
+        f"https://places.googleapis.com/v1/{photo_name}/media"
+        f"?maxWidthPx=800&key={GOOGLE_PLACES_API_KEY}"
+    )
+    try:
+        with urllib.request.urlopen(media_url, timeout=15) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "")
+    except Exception as e:
+        print(f"  ! Places photo download failed for '{slug}': {e}")
+        return None
+
+    ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".jpg"
+    ext = ".jpg" if ext in (".jpe", ".jfif") else ext
+    if ext not in IMAGE_EXT:
+        ext = ".jpg"
+
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    dest = IMAGES / f"{slug}{ext}"
+    dest.write_bytes(data)
+    print(f"  + fetched {dest.name} from Google Places")
+    return dest.name
 
 
 def initials(title: str) -> str:
@@ -206,7 +326,9 @@ def load_shops():
                     "postcode": (row.get("postalCode") or "110017").strip(),
                     # Your own writing goes in the CSV's `description` column.
                     "blurb": (row.get("description") or "").strip(),
-                    "image": find_image(slug),
+                    "image": find_image(slug)
+                    or fetch_place_photo((row.get("placeId") or "").strip(), slug)
+                    or download_image(row.get("image_url"), slug),
                 }
             )
 
@@ -349,18 +471,32 @@ def build_home(shops):
         for n in names
     )
 
+    hero_video = ""
+    hero_class = "hero-inner"
+    if HERO_VIDEO.strip():
+        hero_class += " hero-inner--split"
+        hero_video = f"""<div class="hero-video">
+      <iframe src="https://www.youtube-nocookie.com/embed/{esc(HERO_VIDEO.strip())}"
+        title="{esc(HERO_VIDEO_CAPTION)}" loading="lazy" allowfullscreen
+        allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+        referrerpolicy="strict-origin-when-cross-origin"></iframe>
+    </div>"""
+
     body = f"""<section class="hero">
   <div class="hero-glow" aria-hidden="true"></div>
-  <div class="wrap hero-inner">
-    <p class="eyebrow">{len(shops)} businesses &middot; {len(CATEGORIES)} categories &middot; {esc(AREA)}</p>
-    <h1 class="hero-title">{esc(SITE_TAGLINE)}</h1>
-    <p class="hero-lede">A working directory of the shops, salons, laundries and
-    kitchens between the main market and Khirki Extension. Addresses, phone
-    numbers and directions, checked by hand rather than scraped and forgotten.</p>
-    <div class="hero-cta">
-      <a class="btn" href="#browse">Browse the directory</a>
-      <span class="hero-note">No sign-up. No app. Just the list.</span>
+  <div class="wrap {hero_class}">
+    <div class="hero-copy">
+      <p class="eyebrow">{len(shops)} businesses &middot; {len(CATEGORIES)} categories &middot; {esc(AREA)}</p>
+      <h1 class="hero-title">{esc(SITE_TAGLINE)}</h1>
+      <p class="hero-lede">A working directory of the shops, salons, laundries and
+      kitchens between the main market and Khirki Extension. Addresses, phone
+      numbers and directions, checked by hand rather than scraped and forgotten.</p>
+      <div class="hero-cta">
+        <a class="btn" href="#browse">Browse the directory</a>
+        <span class="hero-note">No sign-up. No app. Just the list.</span>
+      </div>
     </div>
+    {hero_video}
   </div>
   <div class="ticker" aria-hidden="true"><div class="ticker-run">{strip}{strip}</div></div>
 </section>
