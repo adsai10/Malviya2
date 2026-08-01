@@ -87,7 +87,7 @@ ABOUT_VIDEO_CAPTION = "A morning walk through the main market, filmed in July 20
 # Same idea as ABOUT_VIDEO above - paste a YouTube video ID to show a short
 # clip in the hero, next to the headline. Leave it empty and the hero just
 # stays text-only (today's layout).
-HERO_VIDEO = ""
+HERO_VIDEO = "0mNoliWVk4M"
 HERO_VIDEO_CAPTION = f"A quick look at {AREA}."
 
 # Market photos go in images/gallery/ - any .jpg/.png/.webp is picked up.
