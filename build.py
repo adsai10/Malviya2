@@ -10,6 +10,7 @@ Then: commit dist/ and push. Vercel serves it.
 
 import csv
 import html
+import io
 import json
 import mimetypes
 import os
@@ -17,6 +18,7 @@ import re
 import shutil
 import unicodedata
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # ----------------------------------------------------------------------------
@@ -85,13 +87,30 @@ ABOUT_VIDEO_CAPTION = "A morning walk through the main market, filmed in July 20
 # Same idea as ABOUT_VIDEO above - paste a YouTube video ID to show a short
 # clip in the hero, next to the headline. Leave it empty and the hero just
 # stays text-only (today's layout).
-HERO_VIDEO = "0mNoliWVk4M"
+HERO_VIDEO = ""
 HERO_VIDEO_CAPTION = f"A quick look at {AREA}."
 
 # Market photos go in images/gallery/ - any .jpg/.png/.webp is picked up.
 # The filename becomes the caption, so name them properly:
 #   main-market-at-dusk.jpg  ->  "Main market at dusk"
 GALLERY = Path("images/gallery")
+
+# BLOGS & EVENTS
+# Blog posts: data/blog_posts.csv - columns are title, date (YYYY-MM-DD),
+# author, excerpt, body (and optionally image_url). Write the body as one
+# paragraph per line in the cell - Alt+Enter between paragraphs in Excel or
+# Google Sheets - and each line becomes its own <p> automatically.
+# Cover photos also work the local-file way, same as shops:
+#   images/blog/<slug-of-the-title>.jpg
+#
+# Events: data/events.csv - columns are title, date (YYYY-MM-DD), time,
+# location, description, link. Anything dated today or later shows up under
+# "Upcoming events", soonest first - past events drop off the page on their
+# own, no manual cleanup needed.
+BLOG_SLUG = "blog-events"
+BLOG_DATA = Path("data/blog_posts.csv")
+EVENTS_DATA = Path("data/events.csv")
+BLOG_IMAGES = Path("images/blog")
 
 OUT = Path("dist")
 DATA = Path("data/shops.csv")
@@ -119,6 +138,25 @@ GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 # ----------------------------------------------------------------------------
 
 
+def read_csv_rows(path: Path):
+    """Read a CSV into a list of dict rows, tolerant of whatever encoding
+    Excel actually saved it in. Excel's plain "CSV (Comma delimited)" option
+    on Windows writes Windows-1252, not UTF-8 - so an accented character
+    (cafe with an accent, a curly "smart quote" from autocorrect, etc.) can
+    otherwise crash the build with a UnicodeDecodeError. This tries UTF-8
+    first (the correct, portable choice) and quietly falls back if needed."""
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return list(csv.DictReader(io.StringIO(text)))
+
+
 def slugify(text: str) -> str:
     """Turn a shop name into a clean, URL-safe slug."""
     text = unicodedata.normalize("NFKD", text)
@@ -141,23 +179,36 @@ def truncate(text: str, limit: int = 155) -> str:
     return text[:limit].rsplit(" ", 1)[0].rstrip(",.;:") + "..."
 
 
-def find_image(slug: str):
-    """Return the filename of a photo for this slug, or None."""
+def paragraphs_html(text: str) -> str:
+    """Turn a blog post body into <p> tags. Each non-blank line in the
+    source CSV cell becomes one paragraph - so in Excel/Sheets, paragraphs
+    are just separate lines within the cell (Alt+Enter between them)."""
+    lines = [ln.strip() for ln in re.split(r"\r\n|\r|\n", text or "")]
+    return "".join(f"<p>{esc(ln)}</p>" for ln in lines if ln)
+
+
+def find_image_in(folder: Path, slug: str):
+    """Return the filename of a photo for this slug inside `folder`, or None."""
     for ext in IMAGE_EXT:
-        if (IMAGES / f"{slug}{ext}").exists():
+        if (folder / f"{slug}{ext}").exists():
             return f"{slug}{ext}"
     return None
 
 
-def download_image(url: str, slug: str):
-    """Download url into images/<slug>.<ext>. Returns the filename, or None
+def find_image(slug: str):
+    """Return the filename of a shop photo for this slug, or None."""
+    return find_image_in(IMAGES, slug)
+
+
+def download_image_to(folder: Path, url: str, slug: str):
+    """Download url into folder/<slug>.<ext>. Returns the filename, or None
     on failure (a missing/broken URL just falls back to the placeholder tile,
     it never stops the build)."""
     url = (url or "").strip()
     if not url:
         return None
 
-    existing = find_image(slug)
+    existing = find_image_in(folder, slug)
     if existing:  # already downloaded (or hand-placed) - don't re-fetch
         return existing
 
@@ -180,11 +231,16 @@ def download_image(url: str, slug: str):
         if ext not in IMAGE_EXT:
             ext = ".jpg"
 
-    IMAGES.mkdir(parents=True, exist_ok=True)
-    dest = IMAGES / f"{slug}{ext}"
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / f"{slug}{ext}"
     dest.write_bytes(data)
     print(f"  + downloaded {dest.name}")
     return dest.name
+
+
+def download_image(url: str, slug: str):
+    """Download a shop photo url into images/<slug>.<ext>."""
+    return download_image_to(IMAGES, url, slug)
 
 
 def fetch_place_photo(place_id: str, slug: str):
@@ -287,52 +343,129 @@ def load_shops():
     cat_by_name = {c["name"]: c for c in CATEGORIES}
     shops, skipped, seen = [], [], set()
 
-    with DATA.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            title = (row.get("title") or "").strip()
-            cat_name = (row.get("Category") or "").strip()
+    for row in read_csv_rows(DATA):
+        title = (row.get("title") or "").strip()
+        cat_name = (row.get("Category") or "").strip()
 
-            if not title or cat_name not in cat_by_name:
-                skipped.append(title or "(untitled row)")
-                continue
+        if not title or cat_name not in cat_by_name:
+            skipped.append(title or "(untitled row)")
+            continue
 
-            slug = slugify(title)
-            while slug in seen:  # guarantee unique URLs
-                slug += "-2"
-            seen.add(slug)
+        slug = slugify(title)
+        while slug in seen:  # guarantee unique URLs
+            slug += "-2"
+        seen.add(slug)
 
-            try:
-                rating = float(row.get("totalScore") or 0)
-            except ValueError:
-                rating = 0.0
-            try:
-                reviews = int(float(row.get("reviewsCount") or 0))
-            except ValueError:
-                reviews = 0
+        try:
+            rating = float(row.get("totalScore") or 0)
+        except ValueError:
+            rating = 0.0
+        try:
+            reviews = int(float(row.get("reviewsCount") or 0))
+        except ValueError:
+            reviews = 0
 
-            shops.append(
-                {
-                    "title": title,
-                    "slug": slug,
-                    "category": cat_by_name[cat_name],
-                    "type": (row.get("categoryName") or "").strip(),
-                    "address": (row.get("address") or "").strip(),
-                    "phone": (row.get("phone") or "").strip(),
-                    "phone_raw": (row.get("phoneUnformatted") or "").strip(),
-                    "website": (row.get("website") or "").strip(),
-                    "rating": rating,
-                    "reviews": reviews,
-                    "maps": (row.get("url") or "").strip(),
-                    "postcode": (row.get("postalCode") or "110017").strip(),
-                    # Your own writing goes in the CSV's `description` column.
-                    "blurb": (row.get("description") or "").strip(),
-                    "image": find_image(slug)
-                    or fetch_place_photo((row.get("placeId") or "").strip(), slug)
-                    or download_image(row.get("image_url"), slug),
-                }
-            )
+        shops.append(
+            {
+                "title": title,
+                "slug": slug,
+                "category": cat_by_name[cat_name],
+                "type": (row.get("categoryName") or "").strip(),
+                "address": (row.get("address") or "").strip(),
+                "phone": (row.get("phone") or "").strip(),
+                "phone_raw": (row.get("phoneUnformatted") or "").strip(),
+                "website": (row.get("website") or "").strip(),
+                "rating": rating,
+                "reviews": reviews,
+                "maps": (row.get("url") or "").strip(),
+                "postcode": (row.get("postalCode") or "110017").strip(),
+                # Your own writing goes in the CSV's `description` column.
+                "blurb": (row.get("description") or "").strip(),
+                "image": find_image(slug)
+                or fetch_place_photo((row.get("placeId") or "").strip(), slug)
+                or download_image(row.get("image_url"), slug),
+            }
+        )
 
     return shops, skipped
+
+
+def load_blog_posts():
+    """Read data/blog_posts.csv into a list of post dicts, newest first.
+    Missing file or empty rows just mean no posts - never an error."""
+    posts, seen = [], set()
+    if not BLOG_DATA.exists():
+        return posts
+
+    for row in read_csv_rows(BLOG_DATA):
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+
+        slug = slugify(title)
+        while slug in seen:
+            slug += "-2"
+        seen.add(slug)
+
+        try:
+            date = datetime.strptime((row.get("date") or "").strip(), "%Y-%m-%d").date()
+        except ValueError:
+            date = datetime.today().date()
+
+        posts.append(
+            {
+                "title": title,
+                "slug": slug,
+                "date": date,
+                "date_display": date.strftime("%d %b %Y"),
+                "author": (row.get("author") or "").strip(),
+                "excerpt": (row.get("excerpt") or "").strip(),
+                "body_html": paragraphs_html(row.get("body")),
+                "image": find_image_in(BLOG_IMAGES, slug)
+                or download_image_to(BLOG_IMAGES, row.get("image_url"), slug),
+            }
+        )
+
+    posts.sort(key=lambda p: p["date"], reverse=True)
+    return posts
+
+
+def load_events():
+    """Read data/events.csv into a list of upcoming event dicts, soonest
+    first. Events dated before today are dropped automatically - no manual
+    cleanup needed. Missing file just means no events, never an error."""
+    events = []
+    if not EVENTS_DATA.exists():
+        return events
+
+    today = datetime.today().date()
+    for row in read_csv_rows(EVENTS_DATA):
+        title = (row.get("title") or "").strip()
+        if not title:
+            continue
+        try:
+            date = datetime.strptime((row.get("date") or "").strip(), "%Y-%m-%d").date()
+        except ValueError:
+            continue  # no usable date - can't judge "upcoming", so skip it
+        if date < today:
+            continue
+
+        events.append(
+            {
+                "title": title,
+                "date": date,
+                "day": date.strftime("%d"),
+                "mon": date.strftime("%b").upper(),
+                "date_display": date.strftime("%A, %d %b %Y"),
+                "time": (row.get("time") or "").strip(),
+                "location": (row.get("location") or "").strip(),
+                "description": (row.get("description") or "").strip(),
+                "link": (row.get("link") or "").strip(),
+            }
+        )
+
+    events.sort(key=lambda e: e["date"])
+    return events
 
 
 # ----------------------------------------------------------------------------
@@ -358,6 +491,7 @@ def page(*, title, meta, canonical, body, schema=None, depth=1, image=None):
     nav = "".join(
         f'<a href="{root}{c["slug"]}/">{esc(c["name"])}</a>' for c in CATEGORIES
     )
+    nav += f'<a href="{root}{BLOG_SLUG}/">Blogs &amp; Events</a>'
     nav += f'<a class="nav-about" href="{root}about-malviya-nagar/">About {esc(AREA)}</a>' 
 
     return f"""<!DOCTYPE html>
@@ -432,6 +566,46 @@ def shop_card(shop, root=""):
     </div>
     <a class="card-more" href="{href}">Show more details
       <span aria-hidden="true">&rarr;</span></a>
+  </div>
+</li>"""
+
+
+def blog_card(post, root=""):
+    href = f"{post['slug']}/"
+    img_html = (
+        f'<img class="blog-card-photo" src="{root}img/blog/{esc(post["image"])}" '
+        f'alt="{esc(post["title"])}" loading="lazy" decoding="async">'
+        if post["image"] else ""
+    )
+    meta = esc(post["date_display"])
+    if post["author"]:
+        meta += f" &middot; {esc(post['author'])}"
+    return f"""<li class="blog-card">
+  <a class="blog-card-photo-link" href="{href}" tabindex="-1" aria-hidden="true">{img_html}</a>
+  <div class="blog-card-body">
+    <p class="blog-card-date">{meta}</p>
+    <h3 class="blog-card-title"><a href="{href}">{esc(post['title'])}</a></h3>
+    <p class="blog-card-excerpt">{esc(truncate(post['excerpt'], 140))}</p>
+    <a class="blog-card-more" href="{href}">Read more <span aria-hidden="true">&rarr;</span></a>
+  </div>
+</li>"""
+
+
+def event_row(ev):
+    link_html = ""
+    if ev["link"]:
+        link_html = (
+            f'<a class="event-link" href="{esc(ev["link"])}" rel="nofollow noopener" '
+            f'target="_blank">More info <span aria-hidden="true">&rarr;</span></a>'
+        )
+    meta = " &middot; ".join(esc(b) for b in (ev["time"], ev["location"]) if b)
+    return f"""<li class="event-row">
+  <div class="event-date"><span class="day">{esc(ev['day'])}</span><span class="mon">{esc(ev['mon'])}</span></div>
+  <div class="event-body">
+    <h3 class="event-title">{esc(ev['title'])}</h3>
+    <p class="event-meta">{meta}</p>
+    <p class="event-desc">{esc(ev['description'])}</p>
+    {link_html}
   </div>
 </li>"""
 
@@ -835,10 +1009,133 @@ def build_about(shops):
     )
 
 
-def build_sitemap(shops):
-    urls = [f"{SITE_URL}/", f"{SITE_URL}/about-malviya-nagar/"]
+def build_blog_events(posts, events):
+    """The Blogs & Events landing page: recent posts + upcoming events."""
+    if posts:
+        posts_html = f'<ul class="blog-cards">{"".join(blog_card(p) for p in posts)}</ul>'
+    else:
+        posts_html = """<p class="lede">No posts yet. Add rows to <code>data/blog_posts.csv</code>
+    &mdash; title, date, author, excerpt and body &mdash; and each one gets its own page here.</p>"""
+
+    if events:
+        events_html = f'<ul class="events-list">{"".join(event_row(e) for e in events)}</ul>'
+    else:
+        events_html = """<p class="lede">No upcoming events right now. Add rows to
+    <code>data/events.csv</code> and anything dated today or later shows up here automatically
+    &mdash; past events drop off on their own.</p>"""
+
+    body = f"""<section class="band" style="--a:#C74B52;--t:#FAE9E9">
+  <div class="wrap">
+    <nav class="crumbs"><a href="../">Home</a> <span>/</span> Blogs &amp; Events</nav>
+    <p class="eyebrow">From the desk of {esc(SITE_NAME)}</p>
+    <h1 class="page-title">Blogs &amp; Upcoming Events</h1>
+    <p class="lede">Notes on the neighbourhood, and what&rsquo;s happening in {esc(AREA)} next.</p>
+  </div>
+</section>
+
+<section class="wrap section">
+  <h2 class="section-head">From the blog</h2>
+  {posts_html}
+</section>
+
+<section class="wrap section">
+  <h2 class="section-head">Upcoming events</h2>
+  {events_html}
+</section>"""
+
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "CollectionPage",
+        "name": "Blogs & Upcoming Events",
+        "url": f"{SITE_URL}/{BLOG_SLUG}/",
+        "description": f"Blog posts and upcoming events in {AREA}, {CITY}.",
+    }
+
+    write(
+        OUT / BLOG_SLUG / "index.html",
+        page(
+            title=f"Blogs & Upcoming Events in {AREA} | {SITE_NAME}",
+            meta=f"Neighbourhood blog posts and upcoming local events in {AREA}, {CITY}.",
+            canonical=f"{SITE_URL}/{BLOG_SLUG}/",
+            body=body,
+            schema=schema,
+            depth=1,
+        ),
+    )
+
+
+def build_blog_post(post, posts):
+    """One blog post's own page, plus a 'more from the blog' list."""
+    url = f"{SITE_URL}/{BLOG_SLUG}/{post['slug']}/"
+
+    idx = posts.index(post)
+    more = (posts[idx + 1 :] + posts[:idx])[:4]
+    more_html = "".join(
+        f'<li><a href="../{p["slug"]}/">{esc(p["title"])}</a>'
+        f'<span>{esc(p["date_display"])}</span></li>'
+        for p in more
+    )
+
+    cover = ""
+    if post["image"]:
+        cover = (
+            f'<img class="article-cover" src="../../img/blog/{esc(post["image"])}" '
+            f'alt="{esc(post["title"])}" loading="lazy" decoding="async">'
+        )
+
+    meta_line = esc(post["date_display"])
+    if post["author"]:
+        meta_line += f" &middot; {esc(post['author'])}"
+
+    body = f"""<section class="band" style="--a:#C74B52;--t:#FAE9E9">
+  <div class="wrap">
+    <nav class="crumbs">
+      <a href="../../">Home</a> <span>/</span>
+      <a href="../">Blogs &amp; Events</a> <span>/</span> {esc(post['title'])}
+    </nav>
+    <p class="eyebrow">Blog</p>
+    <h1 class="page-title">{esc(post['title'])}</h1>
+    <p class="article-meta">{meta_line}</p>
+  </div>
+</section>
+<article class="wrap section prose">
+  {cover}
+  {post['body_html'] or f'<p>{esc(post["excerpt"])}</p>'}
+
+  <h2 class="section-head">More from the blog</h2>
+  <ol class="toplist">{more_html}</ol>
+</article>"""
+
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "BlogPosting",
+        "headline": post["title"],
+        "datePublished": post["date"].isoformat(),
+        "url": url,
+        "author": {"@type": "Person", "name": post["author"] or SITE_NAME},
+    }
+    if post["image"]:
+        schema["image"] = f"{SITE_URL}/img/blog/{post['image']}"
+
+    write(
+        OUT / BLOG_SLUG / post["slug"] / "index.html",
+        page(
+            title=f"{post['title']} | {SITE_NAME} Blog",
+            meta=truncate(post["excerpt"] or post["title"]),
+            canonical=url,
+            body=body,
+            schema=schema,
+            depth=2,
+            image=(f"blog/{post['image']}" if post["image"] else None),
+        ),
+    )
+
+
+def build_sitemap(shops, posts):
+    urls = [f"{SITE_URL}/", f"{SITE_URL}/about-malviya-nagar/", f"{SITE_URL}/{BLOG_SLUG}/"]
     urls += [f"{SITE_URL}/{c['slug']}/" for c in CATEGORIES]
     urls += [f"{SITE_URL}/{s['category']['slug']}/{s['slug']}/" for s in shops]
+    urls += [f"{SITE_URL}/{BLOG_SLUG}/{p['slug']}/" for p in posts]
 
     entries = "".join(f"\n  <url><loc>{u}</loc></url>" for u in urls)
     write(
@@ -867,6 +1164,8 @@ def main():
     shops, skipped = load_shops()
     if not shops:
         raise SystemExit("No shops loaded - check data/shops.csv has a Category column.")
+    posts = load_blog_posts()
+    events = load_events()
 
     build_home(shops)
     build_about(shops)
@@ -875,7 +1174,11 @@ def main():
         for shop in members:
             build_shop(shop, members)
 
-    total_urls = build_sitemap(shops)
+    build_blog_events(posts, events)
+    for post in posts:
+        build_blog_post(post, posts)
+
+    total_urls = build_sitemap(shops, posts)
     shutil.copy(ASSETS / "style.css", OUT / "style.css")
     if IMAGES.exists() and any(IMAGES.rglob("*")):
         shutil.copytree(IMAGES, OUT / "img", dirs_exist_ok=True)
@@ -887,9 +1190,12 @@ def main():
     for cat in CATEGORIES:
         n = len([s for s in shops if s["category"] is cat])
         print(f"  {cat['name']:<22} {n:>3}  ->  /{cat['slug']}/")
+    print(f"  {'Blogs & Events':<22} {len(posts):>3}  ->  /{BLOG_SLUG}/")
     print(f"\nPhotos: {len(shops) - len(no_photo)} of {len(shops)} listings have one.")
     if no_photo:
         print("Add more as images/<slug>.jpg - the slug is the URL segment above.")
+    print(f"Blog: {len(posts)} post(s) in data/blog_posts.csv.")
+    print(f"Events: {len(events)} upcoming in data/events.csv (past ones drop off automatically).")
     if skipped:
         print(f"\nSkipped {len(skipped)} rows with no matching Category.")
     if missing:
