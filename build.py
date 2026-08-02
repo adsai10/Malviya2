@@ -1136,7 +1136,7 @@ def build_home(shops):
         gallery_files = sorted(
             file for file in GALLERY.iterdir()
             if file.suffix.lower() in IMAGE_EXT and not file.name.startswith(".")
-        )[:6]
+        )
 
     carousel_slides = ""
     carousel_dots = ""
