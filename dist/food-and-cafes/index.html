@@ -625,16 +625,17 @@
 
 <script>
   document.addEventListener("DOMContentLoaded", () => {
+    const targets = document.querySelectorAll(
+      "main > .band, main > .section, .footer, .tiles .tile"
+    );
+
     if (
       !("IntersectionObserver" in window) ||
       window.matchMedia("(prefers-reduced-motion: reduce)").matches
     ) {
-      return;
+      return; // elements never get the .reveal class below, so they stay
+               // at their normal, fully visible default - nothing to do.
     }
-
-    const targets = document.querySelectorAll(
-      "main > .band, main > .section, .footer, .tiles .tile"
-    );
 
     const observer = new IntersectionObserver((entries, currentObserver) => {
       entries.forEach((entry) => {
@@ -657,6 +658,14 @@
 
       observer.observe(element);
     });
+
+    // Safety net: this is a cosmetic fade-in only, and it must never be
+    // able to leave real content (addresses, phone numbers) permanently
+    // invisible if the observer fails to fire on some device or browser.
+    // Force everything visible shortly after load no matter what.
+    window.setTimeout(() => {
+      targets.forEach((element) => element.classList.add("is-visible"));
+    }, 1200);
   });
 </script>
 </body>
