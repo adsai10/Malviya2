@@ -798,9 +798,7 @@ def page(*, title, meta, canonical, body, schema=None, depth=1, image=None):
 
 <script>
   document.addEventListener("DOMContentLoaded", () => {{
-    const targets = document.querySelectorAll(
-      "main > .band, main > .section, .footer, .tiles .tile"
-    );
+    const targets = document.querySelectorAll(".footer, .tiles .tile");
 
     if (
       !("IntersectionObserver" in window) ||
